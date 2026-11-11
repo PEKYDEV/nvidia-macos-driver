@@ -26,10 +26,13 @@ assert '&fConnectNotify' in extract(src, 'void NVRMNVDAFramebuffer::stop(')
 assert src.index('fConnectNotify = nvrmfbCall(connectNotifyFire, this)') < src.index('super::start(provider)')
 assert 'return !fDpyLost && !fHidden && fEdidSize >= 128;' in src
 hotplug = extract(src, 'void NVRMNVDAFramebuffer::hotplugFire(')
-missing = hotplug[hotplug.index('for (int k = 0; k < gNDpy; k++'):]
-missing = missing[:missing.index('surroundCheck();')]
-assert 'if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;' in missing
-assert 'fb->fDpyLost = true;' in missing and 'fb->fEdidSize = 0;' in missing and 'fb->clearDisplayAudioProperties();' in missing
+# A known display that NVKMS's list leaves out takes the known-display path (it is added to the pass with the event
+# hints), so a confirmed disconnect is handled there; tools/p16/test_dynamic_display_events.py runs that path
+# (disconnect, disconnect-query-failed, reconnect).
+assert 'nvrmAppendDisplay(handles, &n, capacity, gDpy[k].handle)' in hotplug
+known = hotplug[hotplug.index('if (known) {'):hotplug.index('if (!dynOk || !dd->connected) continue;')]
+assert 'if (!dynOk) continue;' in known
+assert 'fb->fDpyLost = true;' in known and 'fb->fEdidSize = 0;' in known and 'fb->clearDisplayAudioProperties();' in known
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')
 assert 'fb->fDpyLost = false;' in hotplug and 'fb->notifyConnectionChanged(500);' in hotplug

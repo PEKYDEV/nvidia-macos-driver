@@ -712,9 +712,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
         // A display connected (or a connector changed) after boot: look for it off this context, after a short
         // settle (EDID reads follow the hot-plug interrupt).
         if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
-            hotplugKick();
+            hotplugKick(event->type == NVKMS_EVENT_TYPE_DPY_CHANGED ?
+                event->u.displayChanged.display : event->u.dynamicDisplayConnected.display);
     }
-    static void hotplugKick();
+    // display: the event's display ID, kept for the worker. The boot retry, the poll and start() pass none.
+    static void hotplugKick(NvKmsKapiDisplay display = 0);
     static void hotplugPollFire(thread_call_param_t, thread_call_param_t);
     static void hotplugFire(thread_call_param_t p0, thread_call_param_t);
     static void flipWake(unsigned head);
@@ -839,6 +841,31 @@ static NvU32 nvrmQueryHdaConnectorType(struct NvKmsKapiFunctionsTable *kms, stru
 static struct NvKmsKapiDevice *gDev;
 static struct nvrm_dpy_rec gDpy[NVKMS_KAPI_MAX_CONNECTORS * 2];
 static int gNDpy = -1;
+// Dynamic display event hints are one-bit NVDpyIds in NVIDIA 620.70.06 (32 IDs total). Keep them across passes: a
+// failed query or a disconnect must not lose a dynamic (DP MST) ID that getDisplays never lists. The event callback
+// only ORs a bit; it takes no lock and calls nothing in NVKMS.
+static NvU32 gHotplugDisplays;
+static bool nvrmValidDisplay(NvKmsKapiDisplay display)
+{
+    return display && !(display & (display - 1));
+}
+static void nvrmRememberDisplay(NvKmsKapiDisplay display)
+{
+    if (nvrmValidDisplay(display)) __atomic_fetch_or(&gHotplugDisplays, display, __ATOMIC_RELAXED);
+}
+static void nvrmAppendDisplay(NvKmsKapiDisplay *handles, NvU32 *count, NvU32 capacity, NvKmsKapiDisplay display)
+{
+    if (!nvrmValidDisplay(display)) return;
+    for (NvU32 i = 0; i < *count; ++i) if (handles[i] == display) return;
+    if (*count >= capacity) return;
+    handles[(*count)++] = display;
+}
+static void nvrmAppendEventDisplays(NvKmsKapiDisplay *handles, NvU32 *count, NvU32 capacity)
+{
+    const NVDpyIdList hints = nvNvU32ToDpyIdList(__atomic_load_n(&gHotplugDisplays, __ATOMIC_RELAXED));
+    NVDpyId id;
+    FOR_ALL_DPY_IDS(id, hints) nvrmAppendDisplay(handles, count, capacity, nvDpyIdToNvU32(id));
+}
 // How many displays the boot enumeration found. A framebuffer whose display index is >= this exists because a display
 // appeared after boot (hotplugFire adds it to gDpy and re-registers the idle nub), and that instance is the one that
 // has to tell the framework its connection is new -- see connectNotifyFire/enableController.
@@ -1155,6 +1182,9 @@ bool NVRMNVDAFramebuffer::kapiInit()
                  & (1u << NVKMS_COMPOSITION_BLENDING_MODE_OPAQUE)) ? "ok" : "*** NOT VALID ***",
               (unsigned)ri->caps.contiguousPhysicalMappings);
     }
+    NvKmsKapiConnector bootConnectors[NVKMS_KAPI_MAX_CONNECTORS] = {};
+    const NvU32 bootConnectorCount = ri->numConnectors <= NVKMS_KAPI_MAX_CONNECTORS ? ri->numConnectors : 0;
+    for (NvU32 i = 0; i < bootConnectorCount; ++i) bootConnectors[i] = ri->connectorHandles[i];
     IOFree(ri, sizeof *ri);
     if (!fKms->declareEventInterest(fDev,
             (1u << NVKMS_EVENT_TYPE_DPY_CHANGED) |
@@ -1169,8 +1199,23 @@ bool NVRMNVDAFramebuffer::kapiInit()
         NvU32 n = capacity;
         // NVKMS returns success and the required count without filling an undersized array.
         // Pass its actual capacity in one call: an MST topology can grow between count and fill.
-        if (!fKms->getDisplays(fDev, &n, handles)) { FBLOG("getDisplays: query failed"); return false; }
-        if (n > capacity) { FBLOG("getDisplays: %u handles exceed capacity %u", n, capacity); return false; }
+        const bool displaysOk = fKms->getDisplays(fDev, &n, handles);
+        if (!displaysOk || n > capacity) {
+            FBLOG("getDisplays: %s; using the connectors' dynamic display IDs", displaysOk ? "too many handles" : "query failed");
+            n = 0;   // never read an unfilled or failed snapshot
+        }
+        const NvU32 listed = n; n = 0;
+        for (NvU32 i = 0; i < listed; ++i) nvrmAppendDisplay(handles, &n, capacity, handles[i]);
+        // Like NVIDIA's own registration path, read each connector's dynamicDpyIdList: an MST sink that was already
+        // connected at boot need not appear in getDisplays, and it sends no new event.
+        for (NvU32 i = 0; i < bootConnectorCount; ++i) {
+            struct NvKmsKapiConnectorInfo ci = {};
+            if (!fKms->getConnectorInfo || !fKms->getConnectorInfo(fDev, bootConnectors[i], &ci)) continue;
+            if (!ci.dynamicDpyIdListValid) continue;
+            NVDpyId id;
+            FOR_ALL_DPY_IDS(id, ci.dynamicDpyIdList) nvrmRememberDisplay(nvDpyIdToNvU32(id));
+        }
+        nvrmAppendEventDisplays(handles, &n, capacity);
         if (n == 0) { FBLOG("getDisplays: none"); return false; }
         FBLOG("getDisplays: %u handle(s); this GPU has %u heads and %u connectors",
               n, fNumHeads, fNumConnectors);
@@ -1801,8 +1846,9 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
           (unsigned)fScalerMaxW, (unsigned)fScalerMaxH,
           short_ ? "; its largest modes need more scanout memory than this start reserved - full size after a restart" : "");
 }
-void NVRMNVDAFramebuffer::hotplugKick()
+void NVRMNVDAFramebuffer::hotplugKick(NvKmsKapiDisplay display)
 {
+    nvrmRememberDisplay(display);
     if (!gHotplug) return;
     uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
     thread_call_enter_delayed(gHotplug, d);
@@ -1849,20 +1895,31 @@ void NVRMNVDAFramebuffer::surroundCheck()
 void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
-    if (!me || !me->fKms || !me->fDev || gNDpy < 0) return;
+    if (!me || !me->fKms || !me->fDev) return;
+    IORecursiveLock *sl = startLock();
+    if (!sl) return;
+    IORecursiveLockLock(sl);
+    if (gNDpy < 0) { IORecursiveLockUnlock(sl); return; }
     NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
     const NvU32 capacity = sizeof handles / sizeof handles[0];
     NvU32 n = capacity;
     // Use one capacity-sized snapshot; a count-only query can go stale during MST discovery.
-    if (!me->fKms->getDisplays(me->fDev, &n, handles)) { FBLOG("hot-plug: getDisplays query failed"); return; }
-    if (n > capacity) { FBLOG("hot-plug: %u handles exceed capacity %u", n, capacity); return; }
+    const bool displaysOk = me->fKms->getDisplays(me->fDev, &n, handles);
+    if (!displaysOk || n > capacity) {
+        FBLOG("hot-plug: getDisplays %s; using event and known display IDs", displaysOk ? "too many handles" : "query failed");
+        n = 0;   // never read an unfilled or failed snapshot
+    }
+    const NvU32 listed = n; n = 0;
+    for (NvU32 i = 0; i < listed; ++i) nvrmAppendDisplay(handles, &n, capacity, handles[i]);
+    nvrmAppendEventDisplays(handles, &n, capacity);
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
-    if (!dd) return;
+    if (!dd) { IORecursiveLockUnlock(sl); return; }
     int added = 0;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
-    IORecursiveLock *sl = startLock();
-    if (sl) IORecursiveLockLock(sl);
+    // Known displays take the same path even when neither the list nor the event hints name them: a disconnected one
+    // is found disconnected there, and one that came back is lit again.
+    for (int k = 0; k < gNDpy; ++k) nvrmAppendDisplay(handles, &n, capacity, gDpy[k].handle);
     for (NvU32 i = 0; i < n; i++) {
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
@@ -1926,7 +1983,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         if (!dynOk || !dd->connected) continue;
         struct NvKmsKapiStaticDisplayInfo si = {};
         if (!me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si)) continue;
-        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) break;
+        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) continue;
         struct nvrm_dpy_rec *r = &gDpy[gNDpy];
         r->connected = dd->connected ? NV_TRUE : NV_FALSE; r->mst = si.isDpMST; r->vrr = dd->vrrSupported;
             r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
@@ -1936,24 +1993,6 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         FBLOG("hot-plug: display 0x%x connector 0x%x headMask 0x%x connected after boot -> index %d",
               handles[i], (unsigned)si.connectorHandle, (unsigned)si.headMask, gNDpy);
         gNDpy++; added++;
-    }
-    for (int k = 0; k < gNDpy; k++) {
-        bool listed = false;
-        for (NvU32 i = 0; i < n; i++) if (gDpy[k].handle == handles[i]) { listed = true; break; }
-        if (listed) continue;
-        nvu_zero(dd, sizeof *dd); dd->handle = gDpy[k].handle;
-        if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;
-        gDpy[k].connected = false;
-        for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
-            NVRMNVDAFramebuffer *fb = gFBs[f];
-            if (!fb || fb->fDisplay != gDpy[k].handle || fb->fDpyLost) continue;
-            FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
-                  gDpy[k].handle, fb->fIndex);
-            fb->fDpyLost = true;
-            fb->fEdidSize = 0;
-            fb->clearDisplayAudioProperties();
-            if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
-        }
     }
     for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
         if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
@@ -3120,6 +3159,9 @@ bool NVRMNVDAFramebuffer::start(IOService *provider)
     IORecursiveLockLock(sl); bool kapiOk = kapiInit();
     if (!kapiOk && fOwnsHead) { gHeadsTaken &= ~(1u << fHead); fOwnsHead = false; }
     IORecursiveLockUnlock(sl);
+    // An event may predate the worker or arrive after boot's hint snapshot: once the display table exists, give the
+    // retained IDs a pass.
+    if (fIndex == 0 && __atomic_load_n(&gHotplugDisplays, __ATOMIC_RELAXED)) hotplugKick();
     if (!kapiOk) {
         // nvfbheads=4 starts four framebuffer instances; the ones past the connected displays have nothing to drive and
         // stop here on every healthy boot. Say so, so a log with one lit head is not read as a refused framebuffer.
