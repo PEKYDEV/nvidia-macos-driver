@@ -8,8 +8,10 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>NVAccel</string>
 	<key>CFBundlePackageType</key><string>KEXT</string>
-	<key>CFBundleShortVersionString</key><string>0.1</string>
-	<key>CFBundleVersion</key><string>0.1</string>
+	<key>CFBundleShortVersionString</key><string>2.9-p16</string>
+	<!-- 2.9 as the release gives it; 2.9-p16: the P16 build (pipe-order failure barrier). P16BuildUUID as NVRMFB's. -->
+	<key>CFBundleVersion</key><string>2.9</string>
+	<key>P16BuildUUID</key><string>192A6BAF-BD2C-4FE9-BFB1-95EFC525CDE0</string>
 	<key>OSBundleLibraries</key>
 	<dict>
 		<key>com.apple.iokit.IOAcceleratorFamily2</key><string>2.0.0</string>

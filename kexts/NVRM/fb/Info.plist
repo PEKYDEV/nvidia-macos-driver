@@ -8,10 +8,11 @@
 	<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
 	<key>CFBundleName</key><string>NVRMFB</string>
 	<key>CFBundlePackageType</key><string>KEXT</string>
-	<key>CFBundleShortVersionString</key><string>0.2-p16</string>
-	<!-- A kext version is numbers with an optional d/a/b/fc stage: "0.2-p16" would make the kext invalid.
-	     The P16 build is named by CFBundleShortVersionString and P16BuildUUID. -->
-	<key>CFBundleVersion</key><string>0.2</string>
+	<key>CFBundleShortVersionString</key><string>2.9-p16</string>
+	<!-- 2.9 as the release gives it (the 2.9 release writes 2.9 into the plist; its kmod_info stays as built). A kext
+	     version is numbers with an optional d/a/b/fc stage, so the P16 mark lives in CFBundleShortVersionString and
+	     P16BuildUUID. -->
+	<key>CFBundleVersion</key><string>2.9</string>
 	<!-- P16 local build of the v2.9 framebuffer. Its NVKMS structures come from the 620.70.06 tree with the
 	     kexts/NVRM/patches chain (620-color-range changes NvKmsKapiHeadRequestedConfig), so it pairs only with
 	     the NVRM.kext of NullMoth 2.9 (NVIDIA 620.70.06). -->
