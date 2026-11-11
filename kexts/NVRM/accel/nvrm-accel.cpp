@@ -299,6 +299,7 @@ public:
     IOService *fFB = nullptr;
     IOService *volatile fFBs[kNvMaxFB] = {};
     unsigned fFBRegistered = 0;
+    bool fFBRegistrationFailed = false;
     IOLock *fRegLock = nullptr;
     OSObject *fMetalPlugin = nullptr;
     static bool fbPublished(void *target, void *ref, IOService *newService, IONotifier *note) {
@@ -537,6 +538,7 @@ public:
             uint8_t *dm = (uint8_t *)fDM;
             void *pipe = (b < 16) ? *(void *const volatile *)(dm + 0x88 + 8 * b) : nullptr;
             if (!pipe) {
+                fFBRegistrationFailed = true;
                 *(volatile uint32_t *)(dm + 0x108) = b;
                 ALOG("  %s: index %u -- the family stored a NULL pipe in slot %u (0xe3b5, unchecked) and counted it; "
                      "count put back %u -> %u so no broadcast dereferences it (0xe320). This head gets no pipe this boot.",
@@ -545,6 +547,7 @@ public:
             }
             IOService *pfb = *(IOService *const volatile *)((const uint8_t *)pipe + 0x98);
             if (pfb != fb) {
+                fFBRegistrationFailed = true;
                 ALOG("  %s: index %u -- pipe %u (%p) drives %p, not %s %p; keeping the pipe (it is real), stopping "
                      "the walk so no later head's pipe number is off by this one", why, i, b, pipe, pfb, fb->getName(), fb);
                 break;
@@ -578,6 +581,11 @@ public:
     bool registerFramebufferLocked(int how) {
         if (!fDM) { ALOG("registerFramebuffer(%d): no display machine", how); return false; }
         if (!fFB) { ALOG("registerFramebuffer(%d): no framebuffer has published yet", how); return false; }
+        // Do not let a later walk bypass a failed slot and renumber subsequent heads.
+        if (fFBRegistrationFailed) {
+            ALOG("registerFramebuffer(%d): prior registration failed -- preserving pipe order", how);
+            return false;
+        }
         unsigned before = fDM->getFramebufferCount();
         ALOG("registerFramebuffer(%d): framebuffer count before = %u", how, before);
         if (how == 2) {
