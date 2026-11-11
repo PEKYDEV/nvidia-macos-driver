@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 '''Compile and exercise production NVRMFB connection and DDC methods.'''
-import pathlib, subprocess, sys, tempfile
+import pathlib, re, subprocess, sys, tempfile
 here = pathlib.Path(__file__).resolve()
 roots = [pathlib.Path(sys.argv[1]).resolve()] if len(sys.argv) > 1 else [here.parent.parent, here.parent.parent.parent]
 root = next((p for p in roots if (p / 'kexts/NVRMFB/fb/nvrm-fb.cpp').exists() or (p / 'source.cpp').exists()), None)
@@ -31,7 +31,7 @@ hotplug = extract(src, 'void NVRMNVDAFramebuffer::hotplugFire(')
 # (disconnect, disconnect-query-failed, reconnect).
 assert 'nvrmAppendDisplay(handles, &n, capacity, gDpy[k].handle)' in hotplug
 known = hotplug[hotplug.index('if (known) {'):hotplug.index('if (!dynOk || !dd->connected) continue;')]
-assert 'if (!dynOk) continue;' in known
+assert re.search(r'if \(!dynOk\) (\{ P16LOG\([^;]*\); )?continue;', known)   # a failed query changes nothing
 assert 'fb->fDpyLost = true;' in known and 'fb->fEdidSize = 0;' in known and 'fb->clearDisplayAudioProperties();' in known
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')

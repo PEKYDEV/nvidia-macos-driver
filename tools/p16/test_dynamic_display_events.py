@@ -28,6 +28,11 @@ fixture=fixture.replace(' bool getDisplays(',''' std::function<bool(void*,NvKmsK
  bool getDisplays(''')
 fixture=fixture.replace(' IOService*getProvider()', ' void setProperty(const char*,unsigned long long,unsigned){}\n IOService*getProvider()')
 helpers=''
+# nvfblog=1 here: every P16LOG line is compiled and runs (the logging-neutral test checks off against on)
+fixture+='\nstatic bool fbVerbose(){return true;}\n#define FBLOGV(...) fblog(__VA_ARGS__)\n'
+import re as _re
+_p16=_re.search(r'#define P16LOG\(.*?while \(0\)\n',s,_re.S)
+if _p16: fixture+=_p16.group(0)
 if '// Dynamic display event hints' in s:
  helpers=s[s.index('// Dynamic display event hints'):s.index('// How many displays the boot enumeration found.')]
 helpers=helpers.replace('static int gNDpy = -1;','')

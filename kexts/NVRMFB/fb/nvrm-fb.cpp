@@ -166,6 +166,9 @@ static inline bool fbVerbose(void)
 }
 #define FBLOGV(fmt, ...) do { if (fbVerbose()) { IOLog("NVRM-fb: " fmt "\n", ##__VA_ARGS__); kprintf("NVRM-fb: " fmt "\n", ##__VA_ARGS__); } \
     { char _tb[220]; snprintf(_tb, sizeof _tb, fmt, ##__VA_ARGS__); FBTRACE(_tb); } } while (0)
+// P16 hot-plug (P16HP) and activation (P16ACT) diagnostics: only with nvfblog=1. Off, the arguments are not even
+// evaluated, so a line can never change what the code around it does.
+#define P16LOG(fmt, ...) do { if (fbVerbose()) FBLOGV(fmt, ##__VA_ARGS__); } while (0)
 static const char kPixelFormats[] = IO32BitDirectPixels "\0";
 static const UInt32 kNVRMFBSetTransform = 0x00000400;   // kIOFBSetTransform
 static const IODisplayModeID kModeId = 1;
@@ -702,8 +705,11 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static void eventCallback(const struct NvKmsKapiEvent *event) {
         // only display changes are logged: the routine events arrive every minute for as long as the Mac is up, and
         // in sent logs they pushed every boot line past the collector's 512 KB limit
-        if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
+        if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED) {
             FBLOG("kapi event type %d (display change)", (int)event->type);
+            P16LOG("P16HP event type=%d handle=%u", (int)event->type, (unsigned)(event->type == NVKMS_EVENT_TYPE_DPY_CHANGED ?
+                   event->u.displayChanged.display : event->u.dynamicDisplayConnected.display));
+        }
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
             && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX) {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
@@ -1184,6 +1190,7 @@ bool NVRMNVDAFramebuffer::kapiInit()
     }
     NvKmsKapiConnector bootConnectors[NVKMS_KAPI_MAX_CONNECTORS] = {};
     const NvU32 bootConnectorCount = ri->numConnectors <= NVKMS_KAPI_MAX_CONNECTORS ? ri->numConnectors : 0;
+    if (ri->numConnectors > NVKMS_KAPI_MAX_CONNECTORS) P16LOG("P16HP boot connector count %u exceeds capacity", (unsigned)ri->numConnectors);
     for (NvU32 i = 0; i < bootConnectorCount; ++i) bootConnectors[i] = ri->connectorHandles[i];
     IOFree(ri, sizeof *ri);
     if (!fKms->declareEventInterest(fDev,
@@ -1210,8 +1217,13 @@ bool NVRMNVDAFramebuffer::kapiInit()
         // connected at boot need not appear in getDisplays, and it sends no new event.
         for (NvU32 i = 0; i < bootConnectorCount; ++i) {
             struct NvKmsKapiConnectorInfo ci = {};
-            if (!fKms->getConnectorInfo || !fKms->getConnectorInfo(fDev, bootConnectors[i], &ci)) continue;
-            if (!ci.dynamicDpyIdListValid) continue;
+            if (!fKms->getConnectorInfo || !fKms->getConnectorInfo(fDev, bootConnectors[i], &ci)) {
+                P16LOG("P16HP boot connector=%u dynamic-list skip=query-failed", (unsigned)bootConnectors[i]); continue;
+            }
+            if (!ci.dynamicDpyIdListValid) {
+                P16LOG("P16HP boot connector=%u dynamic-list skip=not-valid", (unsigned)bootConnectors[i]); continue;
+            }
+            P16LOG("P16HP boot connector=%u dynamic-list=0x%x", (unsigned)bootConnectors[i], (unsigned)nvDpyIdListToNvU32(ci.dynamicDpyIdList));
             NVDpyId id;
             FOR_ALL_DPY_IDS(id, ci.dynamicDpyIdList) nvrmRememberDisplay(nvDpyIdToNvU32(id));
         }
@@ -1849,9 +1861,11 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
 void NVRMNVDAFramebuffer::hotplugKick(NvKmsKapiDisplay display)
 {
     nvrmRememberDisplay(display);
-    if (!gHotplug) return;
+    P16LOG("P16HP kick enter handle=%u", (unsigned)display);
+    if (!gHotplug) { P16LOG("P16HP kick skip=no-worker-call"); return; }
     uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
     thread_call_enter_delayed(gHotplug, d);
+    P16LOG("P16HP kick scheduled delay_ms=1500");
 }
 // Boot-arg nvfbhotplugpoll=<seconds> (1..60): look for added and removed displays on a timer as well. Some laptops (a GTX 1660 Ti
 // with its mini-DP and HDMI wired to the GPU, issue 327) never deliver the display-change event while the GPU sleeps, so a
@@ -1895,16 +1909,20 @@ void NVRMNVDAFramebuffer::surroundCheck()
 void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
-    if (!me || !me->fKms || !me->fDev) return;
+    P16LOG("P16HP worker enter");
+    if (!me || !me->fKms || !me->fDev) {
+        P16LOG("P16HP worker return=%s", !me ? "no-framebuffer" : !me->fKms ? "no-kms" : "no-device"); return;
+    }
     IORecursiveLock *sl = startLock();
-    if (!sl) return;
+    if (!sl) { P16LOG("P16HP worker return=no-display-gate"); return; }
     IORecursiveLockLock(sl);
-    if (gNDpy < 0) { IORecursiveLockUnlock(sl); return; }
+    if (gNDpy < 0) { P16LOG("P16HP worker return=not-enumerated"); IORecursiveLockUnlock(sl); return; }
     NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
     const NvU32 capacity = sizeof handles / sizeof handles[0];
     NvU32 n = capacity;
     // Use one capacity-sized snapshot; a count-only query can go stale during MST discovery.
     const bool displaysOk = me->fKms->getDisplays(me->fDev, &n, handles);
+    P16LOG("P16HP getDisplays ok=%u count=%u capacity=%u", (unsigned)displaysOk, displaysOk ? (unsigned)n : 0u, (unsigned)capacity);
     if (!displaysOk || n > capacity) {
         FBLOG("hot-plug: getDisplays %s; using event and known display IDs", displaysOk ? "too many handles" : "query failed");
         n = 0;   // never read an unfilled or failed snapshot
@@ -1913,24 +1931,30 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     for (NvU32 i = 0; i < listed; ++i) nvrmAppendDisplay(handles, &n, capacity, handles[i]);
     nvrmAppendEventDisplays(handles, &n, capacity);
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
-    if (!dd) { IORecursiveLockUnlock(sl); return; }
+    if (!dd) { P16LOG("P16HP worker return=no-dynamic-storage"); IORecursiveLockUnlock(sl); return; }
     int added = 0;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     // Known displays take the same path even when neither the list nor the event hints name them: a disconnected one
     // is found disconnected there, and one that came back is lit again.
     for (int k = 0; k < gNDpy; ++k) nvrmAppendDisplay(handles, &n, capacity, gDpy[k].handle);
+    P16LOG("P16HP worker pass listed=%u total=%u known=%d hints=0x%x", (unsigned)listed, (unsigned)n, gNDpy,
+           (unsigned)__atomic_load_n(&gHotplugDisplays, __ATOMIC_RELAXED));
     for (NvU32 i = 0; i < n; i++) {
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
         bool dynOk = nvrmDynamicDisplayInfo(me->fKms, me->fDev, dd);
+        P16LOG("P16HP handle=%u known=%u dyn_ok=%u connected=%u edid_len=%u", (unsigned)handles[i], (unsigned)known,
+               (unsigned)dynOk, dynOk ? (unsigned)dd->connected : 0u, dynOk ? (unsigned)dd->edid.bufferSize : 0u);
         if (known) {
             // 1401/driver issue #110: switching the monitor to another input and back left it with no picture. The link
             // drops, the head stops scanning out, and this path skipped every display it already knew. A known display
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
-            if (!dynOk) continue;
+            if (!dynOk) { P16LOG("P16HP handle=%u known skip=dynamic-query-failed", (unsigned)handles[i]); continue; }
+            P16LOG("P16HP handle=%u cached connector=%u mst=%u headMask=%u", (unsigned)handles[i],
+                   (unsigned)gDpy[kdpy].connector, (unsigned)gDpy[kdpy].mst, (unsigned)gDpy[kdpy].headMask);
             gDpy[kdpy].connected = dd->connected ? NV_TRUE : NV_FALSE;
             bool audioTypeChanged = false;
             if (dd->connected && kdpy >= 0) {
@@ -1952,9 +1976,11 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                           handles[i], (unsigned)sz, dd->edid.buffer[8], dd->edid.buffer[9], dd->edid.buffer[11], dd->edid.buffer[10]);
                 }
             }
+            unsigned fbMatches = 0, emptySlots = 0, otherHandles = 0;
             for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
                 NVRMNVDAFramebuffer *fb = gFBs[f];
-                if (!fb || fb->fDisplay != handles[i]) continue;
+                if (!fb || fb->fDisplay != handles[i]) { if (!fb) ++emptySlots; else ++otherHandles; continue; }
+                ++fbMatches;
                 if (!dd->connected) {
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
@@ -1962,7 +1988,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
+                        else P16LOG("P16HP handle=%u fb=%u notify skip=queue-full", (unsigned)handles[i], fb->fIndex);
                     }
+                    else P16LOG("P16HP handle=%u fb=%u disconnect skip=already-lost", (unsigned)handles[i], fb->fIndex);
                 } else if (fb->fDpyLost || swapped) {
                     if (fb->fDpyLost && kdpy >= 0) {
                         const struct nvrm_dpy_rec *r = &gDpy[kdpy];
@@ -1976,14 +2004,23 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
                     }
+                    else P16LOG("P16HP handle=%u fb=%u relight skip=queue-full", (unsigned)handles[i], fb->fIndex);
                 } else if (audioTypeChanged) fb->publishDisplayAudioProperties();
+                else P16LOG("P16HP handle=%u fb=%u relight skip=already-connected-unchanged", (unsigned)handles[i], fb->fIndex);
             }
+            P16LOG("P16HP handle=%u known fb-matches=%u empty-slots=%u other-handles=%u", (unsigned)handles[i], fbMatches,
+                   emptySlots, otherHandles);
             continue;
         }
+        if (!dynOk) P16LOG("P16HP handle=%u add skip=dynamic-query-failed", (unsigned)handles[i]);
+        else if (!dd->connected) P16LOG("P16HP handle=%u add skip=disconnected", (unsigned)handles[i]);
         if (!dynOk || !dd->connected) continue;
         struct NvKmsKapiStaticDisplayInfo si = {};
-        if (!me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si)) continue;
-        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) continue;
+        const bool staticOk = me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si);
+        P16LOG("P16HP handle=%u static ok=%u connector=%u mst=%u headMask=%u", (unsigned)handles[i], (unsigned)staticOk,
+               staticOk ? (unsigned)si.connectorHandle : 0u, staticOk ? (unsigned)si.isDpMST : 0u, staticOk ? (unsigned)si.headMask : 0u);
+        if (!staticOk) continue;
+        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) { P16LOG("P16HP handle=%u add skip=display-table-full", (unsigned)handles[i]); continue; }
         struct nvrm_dpy_rec *r = &gDpy[gNDpy];
         r->connected = dd->connected ? NV_TRUE : NV_FALSE; r->mst = si.isDpMST; r->vrr = dd->vrrSupported;
             r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
@@ -1992,6 +2029,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
         FBLOG("hot-plug: display 0x%x connector 0x%x headMask 0x%x connected after boot -> index %d",
               handles[i], (unsigned)si.connectorHandle, (unsigned)si.headMask, gNDpy);
+        P16LOG("P16HP handle=%u add index=%d", (unsigned)handles[i], gNDpy);
         gNDpy++; added++;
     }
     for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
@@ -2005,6 +2043,8 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
         bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
+        P16LOG("P16HP handle=%u fb=%u relight ok=%u head_slept=%u rc=%d", (unsigned)fb->fDisplay, fb->fIndex, (unsigned)ok,
+               (unsigned)fb->fHeadSlept, fb->fReflipRc);
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
@@ -2021,26 +2061,34 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         }
         fb->release();
     }
+    P16LOG("P16HP worker processed added=%d notify=%u relight=%u", added, nnotify, nrelight);
     surroundCheck();
     if (!added) {   // still nothing: a boot that found no display keeps looking, 3 s apart, a few times
         if (gNDpy == 0 && gBootRetry < kNvrmBootRetries) {
             const unsigned ms = nvrmBootRetryDelayMs(gBootRetry++);
             if (ms && gHotplug) { uint64_t d; clock_interval_to_deadline(ms, kMillisecondScale, &d); thread_call_enter_delayed(gHotplug, d); }
         }
+        P16LOG("P16HP worker return=no-added-displays");
         return;
     }
     IOService *nub0 = me->getProvider(), *gpu = nvrmPickNubParent<IOService>(nub0 ? nub0->getProvider() : nullptr, gNubParent);
     OSIterator *it = gpu ? gpu->getChildIterator(gIOServicePlane) : nullptr;
     unsigned matched = 0;
+    if (!it) P16LOG("P16HP match skip=%s", !nub0 ? "no-provider" : !gpu ? "no-gpu-provider" : "no-child-iterator");
     if (it) {
         while (IOService *nub = OSDynamicCast(IOService, it->getNextObject())) {
             OSNumber *ix = OSDynamicCast(OSNumber, nub->getProperty("fb-index"));
-            if (!ix || nub->getClient() || ix->unsigned32BitValue() >= (unsigned)gNDpy) continue;
+            if (!ix || nub->getClient() || ix->unsigned32BitValue() >= (unsigned)gNDpy) {
+                P16LOG("P16HP match skip=%s", !ix ? "no-fb-index" : nub->getClient() ? "has-client" : "index-out-of-range");
+                continue;
+            }
+            P16LOG("P16HP match register index=%u", ix->unsigned32BitValue());
             nub->registerService(kIOServiceAsynchronous);   // matches NVRMFB again: the framebuffer starts on this index
             matched++;
         }
         it->release();
     }
+    if (!matched) P16LOG("P16HP match skip=no-eligible-idle-nub");
     FBLOG("hot-plug: %d display(s) added, %u idle nub(s) matched again", added, matched);
 }
 static char gTrace[32768]; static volatile SInt32 gTraceLen = 0, gTraceN = 0, gTraceFull = 0;
@@ -3429,6 +3477,7 @@ bool NVRMNVDAFramebuffer::proxyMap()
 IOReturn NVRMNVDAFramebuffer::enableController()
 {
     FBLOG("enableController");
+    P16LOG("P16ACT enableController enter fb=%u proxy=%u", fIndex, (unsigned)fProxy);
     if (fProxy) return kIOReturnSuccess;
     fEnableAbs = mach_absolute_time();
     const bool ok = applyMode();
@@ -3448,6 +3497,8 @@ IOReturn NVRMNVDAFramebuffer::enableController()
         notifyConnectionChanged(1500);
         FBLOG("fb%u: connect interrupt scheduled (1.5 s after the mode set)", fIndex);
     }
+    P16LOG("P16ACT enableController exit fb=%u rc=0x%08x mode_ok=%u hotplug_born=%u", fIndex, (unsigned)kIOReturnSuccess,
+           (unsigned)ok, (unsigned)fHotplugBorn);
     return kIOReturnSuccess;
 }
 IOReturn NVRMNVDAFramebuffer::setDisplayMode(IODisplayModeID mode, IOIndex depth)
@@ -5038,8 +5089,12 @@ bool NVRMNVDAFramebuffer::flipToMemory(struct NvKmsKapiMemory *mem, unsigned w, 
 
 IOReturn NVRMNVDAFramebuffer::newUserClient(task_t owningTask, void *securityID, UInt32 type, IOUserClient **handler)
 {
+    P16LOG("P16ACT newUserClient enter fb=%u type=%u", fIndex, (unsigned)type);
     const IOReturn rc = super::newUserClient(owningTask, securityID, type, handler);
     if (rc == kIOReturnSuccess && type == kIOFBServerConnectType) fServerFresh = 1;
+    // A failed superclass call may leave *handler untouched: read it only on success.
+    P16LOG("P16ACT newUserClient super-return fb=%u type=%u rc=0x%08x client=%s", fIndex, (unsigned)type, (unsigned)rc,
+           (rc == kIOReturnSuccess && handler) ? (*handler ? "1" : "0") : "unavailable");
     return rc;
 }
 

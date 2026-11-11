@@ -39,6 +39,7 @@ using NvU32 = uint32_t;
 using NvKmsKapiDisplay = uint32_t;
 constexpr unsigned NVKMS_KAPI_MAX_CONNECTORS = 16;
 #define FBLOG(...) ((void)0)
+#define P16LOG(...) ((void)0)
 struct Api {
     unsigned total = 3, calls = 0;
     bool fail = false;
