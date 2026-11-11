@@ -536,8 +536,12 @@ class NVRMNVDAFramebuffer : public IOFramebuffer {
     static void eventCallback(const struct NvKmsKapiEvent *event) {
         // only display changes are logged: the routine events arrive every minute for as long as the Mac is up, and
         // in sent logs they pushed every boot line past the collector's 512 KB limit
-        if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED)
+        if (event->type == NVKMS_EVENT_TYPE_DPY_CHANGED || event->type == NVKMS_EVENT_TYPE_DYNAMIC_DPY_CONNECTED) {
             FBLOG("kapi event type %d (display change)", (int)event->type);
+            const NvKmsKapiDisplay display = event->type == NVKMS_EVENT_TYPE_DPY_CHANGED ?
+                event->u.displayChanged.display : event->u.dynamicDisplayConnected.display;
+            FBLOG("P16HP event type=%d handle=%u", (int)event->type, (unsigned)display);
+        }
         if (event->type == NVKMS_EVENT_TYPE_FLIP_OCCURRED && event->u.flipOccurred.head < 8
             && event->u.flipOccurred.layer == NVKMS_KAPI_LAYER_PRIMARY_IDX) {
             OSIncrementAtomic(&sFlipLatched[event->u.flipOccurred.head]);
@@ -919,10 +923,14 @@ bool NVRMNVDAFramebuffer::kapiInit()
     else
         FBLOG("declareEventInterest ok (dpy-changed | dynamic-dpy-connected | flip-occurred)");
     if (gNDpy < 0) {
-        NvU32 n = 0; NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2];
-        if (!fKms->getDisplays(fDev, &n, NULL) || n == 0) { FBLOG("getDisplays: none"); return false; }
-        if (n > sizeof handles / sizeof handles[0]) n = sizeof handles / sizeof handles[0];
-        if (!fKms->getDisplays(fDev, &n, handles)) return false;
+        NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
+        const NvU32 capacity = sizeof handles / sizeof handles[0];
+        NvU32 n = capacity;
+        // NVKMS returns success and the required count without filling an undersized array.
+        // Pass its actual capacity in one call: an MST topology can grow between count and fill.
+        if (!fKms->getDisplays(fDev, &n, handles)) { FBLOG("getDisplays: query failed"); return false; }
+        if (n > capacity) { FBLOG("getDisplays: %u handles exceed capacity %u", n, capacity); return false; }
+        if (n == 0) { FBLOG("getDisplays: none"); return false; }
         FBLOG("getDisplays: %u handle(s); this GPU has %u heads and %u connectors",
               n, fNumHeads, fNumConnectors);
         struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
@@ -1532,36 +1540,54 @@ void NVRMNVDAFramebuffer::adoptSwappedDisplay()
 }
 void NVRMNVDAFramebuffer::hotplugKick()
 {
-    if (!gHotplug) return;
+    FBLOG("P16HP kick enter");
+    if (!gHotplug) { FBLOG("P16HP kick skip=no-worker-call"); return; }
     uint64_t d; clock_interval_to_deadline(1500, kMillisecondScale, &d);
     thread_call_enter_delayed(gHotplug, d);
+    FBLOG("P16HP kick scheduled delay_ms=1500");
 }
 void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
-    if (!me || !me->fKms || !me->fDev || gNDpy < 0) return;
-    NvU32 n = 0; NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2];
-    if (!me->fKms->getDisplays(me->fDev, &n, NULL)) return;
-    if (n > sizeof handles / sizeof handles[0]) n = sizeof handles / sizeof handles[0];
-    if (n && !me->fKms->getDisplays(me->fDev, &n, handles)) return;
+    FBLOG("P16HP worker enter");
+    if (!me) { FBLOG("P16HP worker return=no-framebuffer"); return; }
+    if (!me->fKms) { FBLOG("P16HP worker return=no-kms"); return; }
+    if (!me->fDev) { FBLOG("P16HP worker return=no-device"); return; }
+    if (gNDpy < 0) { FBLOG("P16HP worker return=not-enumerated"); return; }
+    NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
+    const NvU32 capacity = sizeof handles / sizeof handles[0];
+    NvU32 n = capacity;
+    // Use one capacity-sized snapshot; a count-only query can go stale during MST discovery.
+    const bool displaysOk = me->fKms->getDisplays(me->fDev, &n, handles);
+    if (displaysOk) FBLOG("P16HP getDisplays ok=1 count=%u capacity=%u", n, capacity);
+    else FBLOG("P16HP getDisplays ok=0 count=unavailable capacity=%u", capacity);
+    if (!displaysOk) { FBLOG("hot-plug: getDisplays query failed"); FBLOG("P16HP worker return=getDisplays-failed"); return; }
+    if (n > capacity) { FBLOG("hot-plug: %u handles exceed capacity %u", n, capacity); FBLOG("P16HP worker return=capacity-exceeded"); return; }
+    for (NvU32 i = 0; i < n; ++i) FBLOG("P16HP getDisplays handle[%u]=%u", i, (unsigned)handles[i]);
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
-    if (!dd) return;
+    if (!dd) { FBLOG("P16HP worker return=no-dynamic-storage"); return; }
     int added = 0;
     NVRMNVDAFramebuffer *relight[16]; unsigned nrelight = 0;
     NVRMNVDAFramebuffer *notify[16]; unsigned nnotify = 0;
     IORecursiveLock *sl = startLock();
     if (sl) IORecursiveLockLock(sl);
+    else FBLOG("P16HP worker gate=unavailable continuing-without-gate");
     for (NvU32 i = 0; i < n; i++) {
         bool known = false; int kdpy = -1;
         for (int k = 0; k < gNDpy; k++) if (gDpy[k].handle == handles[i]) { known = true; kdpy = k; break; }
         nvu_zero(dd, sizeof *dd); dd->handle = handles[i];
         bool dynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
+        if (dynOk) FBLOG("P16HP handle=%u known=%u dyn_ok=1 connected=%u edid_len=%u", (unsigned)handles[i],
+                         (unsigned)known, (unsigned)dd->connected, (unsigned)dd->edid.bufferSize);
+        else FBLOG("P16HP handle=%u known=%u dyn_ok=0 connected=unavailable edid_len=unavailable", (unsigned)handles[i], (unsigned)known);
         if (known) {
             // 1401/driver issue #110: switching the monitor to another input and back left it with no picture. The link
             // drops, the head stops scanning out, and this path skipped every display it already knew. A known display
             // that was seen disconnected and is connected again gets its head lit with the same full mode set the
             // display-wake path uses (reflip). Only on that transition, so other display events cause no modeset.
-            if (!dynOk) continue;
+            if (!dynOk) { FBLOG("P16HP handle=%u known skip=dynamic-query-failed", (unsigned)handles[i]); continue; }
+            FBLOG("P16HP handle=%u cached connector=%u mst=%u headMask=%u", (unsigned)handles[i],
+                  (unsigned)gDpy[kdpy].connector, (unsigned)gDpy[kdpy].mst, (unsigned)gDpy[kdpy].headMask);
             gDpy[kdpy].connected = dd->connected ? NV_TRUE : NV_FALSE;
             bool audioTypeChanged = false;
             if (dd->connected && kdpy >= 0) {
@@ -1583,9 +1609,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                           handles[i], (unsigned)sz, dd->edid.buffer[8], dd->edid.buffer[9], dd->edid.buffer[11], dd->edid.buffer[10]);
                 }
             }
+            unsigned fbMatches = 0, emptySlots = 0, otherHandles = 0;
             for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
                 NVRMNVDAFramebuffer *fb = gFBs[f];
-                if (!fb || fb->fDisplay != handles[i]) continue;
+                if (!fb) { ++emptySlots; continue; }
+                if (fb->fDisplay != handles[i]) { ++otherHandles; continue; }
+                ++fbMatches;
                 if (!dd->connected) {
                     if (!fb->fDpyLost) {
                         FBLOG("hot-plug: display 0x%x went away (fb %u)", handles[i], fb->fIndex);
@@ -1593,7 +1622,9 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                         fb->fEdidSize = 0;
                         fb->clearDisplayAudioProperties();
                         if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
+                        else FBLOG("P16HP handle=%u fb=%u notify skip=queue-full", (unsigned)handles[i], fb->fIndex);
                     }
+                    else FBLOG("P16HP handle=%u fb=%u disconnect skip=already-lost", (unsigned)handles[i], fb->fIndex);
                 } else if (fb->fDpyLost || swapped) {
                     if (fb->fDpyLost && kdpy >= 0) {
                         const struct nvrm_dpy_rec *r = &gDpy[kdpy];
@@ -1607,14 +1638,23 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
                     if (nrelight < sizeof relight / sizeof relight[0]) {
                         fb->retain(); relight[nrelight++] = fb;
                     }
+                    else FBLOG("P16HP handle=%u fb=%u relight skip=queue-full", (unsigned)handles[i], fb->fIndex);
                 } else if (audioTypeChanged) fb->publishDisplayAudioProperties();
+                else FBLOG("P16HP handle=%u fb=%u relight skip=already-connected-unchanged", (unsigned)handles[i], fb->fIndex);
             }
+            FBLOG("P16HP handle=%u known fb-matches=%u empty-slots=%u other-handles=%u", (unsigned)handles[i], fbMatches, emptySlots, otherHandles);
+            FBLOG("P16HP handle=%u add skip=known-handle", (unsigned)handles[i]);
             continue;
         }
-        if (!dynOk || !dd->connected) continue;
+        if (!dynOk) { FBLOG("P16HP handle=%u add skip=dynamic-query-failed", (unsigned)handles[i]); continue; }
+        if (!dd->connected) { FBLOG("P16HP handle=%u add skip=disconnected", (unsigned)handles[i]); continue; }
         struct NvKmsKapiStaticDisplayInfo si = {};
-        if (!me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si)) continue;
-        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) break;
+        const bool staticOk = me->fKms->getStaticDisplayInfo(me->fDev, handles[i], &si);
+        if (staticOk) FBLOG("P16HP handle=%u static ok=1 connector=%u mst=%u headMask=%u", (unsigned)handles[i],
+                            (unsigned)si.connectorHandle, (unsigned)si.isDpMST, (unsigned)si.headMask);
+        else FBLOG("P16HP handle=%u static ok=0 connector=unavailable mst=unavailable headMask=unavailable", (unsigned)handles[i]);
+        if (!staticOk) { FBLOG("P16HP handle=%u add skip=static-query-failed", (unsigned)handles[i]); continue; }
+        if (gNDpy >= (int)(sizeof gDpy / sizeof gDpy[0])) { FBLOG("P16HP handle=%u add skip=display-table-full", (unsigned)handles[i]); break; }
         struct nvrm_dpy_rec *r = &gDpy[gNDpy];
         r->connected = dd->connected ? NV_TRUE : NV_FALSE; r->mst = si.isDpMST;
             r->handle = handles[i]; r->connector = si.connectorHandle; r->headMask = si.headMask; r->internal = si.internal;
@@ -1623,6 +1663,7 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         nvu_copy(r->edid, dd->edid.buffer, r->edidSize);
         FBLOG("hot-plug: display 0x%x connector 0x%x headMask 0x%x connected after boot -> index %d",
               handles[i], (unsigned)si.connectorHandle, (unsigned)si.headMask, gNDpy);
+        FBLOG("P16HP handle=%u add index=%d", (unsigned)handles[i], gNDpy);
         gNDpy++; added++;
     }
     for (int k = 0; k < gNDpy; k++) {
@@ -1630,18 +1671,30 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         for (NvU32 i = 0; i < n; i++) if (gDpy[k].handle == handles[i]) { listed = true; break; }
         if (listed) continue;
         nvu_zero(dd, sizeof *dd); dd->handle = gDpy[k].handle;
-        if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;
+        const bool omittedDynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);
+        if (omittedDynOk) FBLOG("P16HP handle=%u known=1 listed=0 dyn_ok=1 connected=%u edid_len=%u", (unsigned)gDpy[k].handle,
+                               (unsigned)dd->connected, (unsigned)dd->edid.bufferSize);
+        else FBLOG("P16HP handle=%u known=1 listed=0 dyn_ok=0 connected=unavailable edid_len=unavailable", (unsigned)gDpy[k].handle);
+        if (!omittedDynOk) { FBLOG("P16HP handle=%u omitted skip=dynamic-query-failed", (unsigned)gDpy[k].handle); continue; }
+        if (dd->connected) { FBLOG("P16HP handle=%u omitted skip=still-connected", (unsigned)gDpy[k].handle); continue; }
         gDpy[k].connected = false;
+        unsigned fbMatches = 0, emptySlots = 0, otherHandles = 0, alreadyLost = 0;
         for (unsigned f = 0; f < sizeof gFBs / sizeof gFBs[0]; f++) {
             NVRMNVDAFramebuffer *fb = gFBs[f];
-            if (!fb || fb->fDisplay != gDpy[k].handle || fb->fDpyLost) continue;
+            if (!fb) { ++emptySlots; continue; }
+            if (fb->fDisplay != gDpy[k].handle) { ++otherHandles; continue; }
+            if (fb->fDpyLost) { ++alreadyLost; continue; }
+            ++fbMatches;
             FBLOG("hot-plug: known display 0x%x omitted from NVKMS list and confirmed disconnected (fb %u)",
                   gDpy[k].handle, fb->fIndex);
             fb->fDpyLost = true;
             fb->fEdidSize = 0;
             fb->clearDisplayAudioProperties();
             if (nnotify < sizeof notify / sizeof notify[0]) { fb->retain(); notify[nnotify++] = fb; }
+            else FBLOG("P16HP handle=%u fb=%u notify skip=queue-full", (unsigned)gDpy[k].handle, fb->fIndex);
         }
+        FBLOG("P16HP handle=%u omitted fb-matches=%u empty-slots=%u other-handles=%u already-lost=%u",
+              (unsigned)gDpy[k].handle, fbMatches, emptySlots, otherHandles, alreadyLost);
     }
     for (unsigned i = 0; i < sizeof gFBs / sizeof gFBs[0]; ++i)
         if (gFBs[i] && !gFBs[i]->fDpyLost) gFBs[i]->publishDisplayAudioProperties();
@@ -1653,7 +1706,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
     }
     for (unsigned f = 0; f < nrelight; f++) {
         NVRMNVDAFramebuffer *fb = relight[f];
-        bool ok = !OSAddAtomic(0, &fb->fStopping) && !fb->fHeadSlept && fb->reflip();
+        const bool stopping = OSAddAtomic(0, &fb->fStopping) != 0;
+        const bool headSlept = !stopping && fb->fHeadSlept;
+        bool ok = !stopping && !headSlept && fb->reflip();
+        if (stopping) FBLOG("P16HP handle=%u fb=%u relight skip=stopping", (unsigned)fb->fDisplay, fb->fIndex);
+        else if (headSlept) FBLOG("P16HP handle=%u fb=%u relight skip=head-asleep", (unsigned)fb->fDisplay, fb->fIndex);
+        else FBLOG("P16HP handle=%u fb=%u reflip ok=%u rc=%d", (unsigned)fb->fDisplay, fb->fIndex, (unsigned)ok, fb->fReflipRc);
         FBLOG("hot-plug: display 0x%x is back (fb %u): head %u lit again -> ok %u rc %d",
               fb->fDisplay, fb->fIndex, fb->fHead, (unsigned)ok, fb->fReflipRc);
         if (!OSAddAtomic(0, &fb->fStopping) && !fb->fDpyLost) {
@@ -1670,20 +1728,30 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
         }
         fb->release();
     }
-    if (!added) return;
+    FBLOG("P16HP worker processed added=%d notify=%u relight=%u", added, nnotify, nrelight);
+    if (!added) { FBLOG("P16HP worker return=no-added-displays"); return; }
     IOService *nub0 = me->getProvider(), *gpu = nub0 ? nub0->getProvider() : nullptr;
     OSIterator *it = gpu ? gpu->getChildIterator(gIOServicePlane) : nullptr;
     unsigned matched = 0;
+    if (!nub0) FBLOG("P16HP match skip=no-provider");
+    else if (!gpu) FBLOG("P16HP match skip=no-gpu-provider");
+    else if (!it) FBLOG("P16HP match skip=no-child-iterator");
     if (it) {
         while (IOService *nub = OSDynamicCast(IOService, it->getNextObject())) {
             OSNumber *ix = OSDynamicCast(OSNumber, nub->getProperty("fb-index"));
-            if (!ix || nub->getClient() || ix->unsigned32BitValue() >= (unsigned)gNDpy) continue;
+            if (!ix) { FBLOG("P16HP match skip=no-fb-index"); continue; }
+            if (nub->getClient()) { FBLOG("P16HP match skip=has-client"); continue; }
+            const unsigned index = ix->unsigned32BitValue();
+            if (index >= (unsigned)gNDpy) { FBLOG("P16HP match skip=index-out-of-range index=%u displays=%d", index, gNDpy); continue; }
+            FBLOG("P16HP match register index=%u", index);
             nub->registerService(kIOServiceAsynchronous);   // matches NVRMFB again: the framebuffer starts on this index
             matched++;
         }
         it->release();
     }
+    if (!matched) FBLOG("P16HP match skip=no-eligible-idle-nub");
     FBLOG("hot-plug: %d display(s) added, %u idle nub(s) matched again", added, matched);
+    FBLOG("P16HP worker done added=%d matched=%u", added, matched);
 }
 static char gTrace[32768]; static volatile SInt32 gTraceLen = 0, gTraceN = 0, gTraceFull = 0;
 // The trace was published as the registry property "NVRMTrace" on every log line. Registry properties

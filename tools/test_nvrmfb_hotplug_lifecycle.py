@@ -27,8 +27,10 @@ assert src.index('fConnectNotify = nvrmfbCall(connectNotifyFire, this)') < src.i
 assert 'return !fDpyLost && fEdidSize >= 128;' in src
 hotplug = extract(src, 'void NVRMNVDAFramebuffer::hotplugFire(')
 missing = hotplug[hotplug.index('for (int k = 0; k < gNDpy; k++'):]
-missing = missing[:missing.index('if (!added) return;')]
-assert 'if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;' in missing
+missing = missing[:missing.index('IOService *nub0 =')]
+assert 'const bool omittedDynOk = me->fKms->getDynamicDisplayInfo(me->fDev, dd);' in missing
+assert 'if (!omittedDynOk)' in missing and 'if (dd->connected)' in missing
+assert missing.index('if (!omittedDynOk)') < missing.index('if (dd->connected)') < missing.index('gDpy[k].connected = false;')
 assert 'fb->fDpyLost = true;' in missing and 'fb->fEdidSize = 0;' in missing and 'fb->clearDisplayAudioProperties();' in missing
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
 assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')
