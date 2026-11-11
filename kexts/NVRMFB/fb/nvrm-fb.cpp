@@ -919,10 +919,14 @@ bool NVRMNVDAFramebuffer::kapiInit()
     else
         FBLOG("declareEventInterest ok (dpy-changed | dynamic-dpy-connected | flip-occurred)");
     if (gNDpy < 0) {
-        NvU32 n = 0; NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2];
-        if (!fKms->getDisplays(fDev, &n, NULL) || n == 0) { FBLOG("getDisplays: none"); return false; }
-        if (n > sizeof handles / sizeof handles[0]) n = sizeof handles / sizeof handles[0];
-        if (!fKms->getDisplays(fDev, &n, handles)) return false;
+        NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
+        const NvU32 capacity = sizeof handles / sizeof handles[0];
+        NvU32 n = capacity;
+        // NVKMS returns success and the required count without filling an undersized array.
+        // Pass its actual capacity in one call: an MST topology can grow between count and fill.
+        if (!fKms->getDisplays(fDev, &n, handles)) { FBLOG("getDisplays: query failed"); return false; }
+        if (n > capacity) { FBLOG("getDisplays: %u handles exceed capacity %u", n, capacity); return false; }
+        if (n == 0) { FBLOG("getDisplays: none"); return false; }
         FBLOG("getDisplays: %u handle(s); this GPU has %u heads and %u connectors",
               n, fNumHeads, fNumConnectors);
         struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
@@ -1540,10 +1544,12 @@ void NVRMNVDAFramebuffer::hotplugFire(thread_call_param_t, thread_call_param_t)
 {
     NVRMNVDAFramebuffer *me = gFB;
     if (!me || !me->fKms || !me->fDev || gNDpy < 0) return;
-    NvU32 n = 0; NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2];
-    if (!me->fKms->getDisplays(me->fDev, &n, NULL)) return;
-    if (n > sizeof handles / sizeof handles[0]) n = sizeof handles / sizeof handles[0];
-    if (n && !me->fKms->getDisplays(me->fDev, &n, handles)) return;
+    NvKmsKapiDisplay handles[NVKMS_KAPI_MAX_CONNECTORS * 2] = {};
+    const NvU32 capacity = sizeof handles / sizeof handles[0];
+    NvU32 n = capacity;
+    // Use one capacity-sized snapshot; a count-only query can go stale during MST discovery.
+    if (!me->fKms->getDisplays(me->fDev, &n, handles)) { FBLOG("hot-plug: getDisplays query failed"); return; }
+    if (n > capacity) { FBLOG("hot-plug: %u handles exceed capacity %u", n, capacity); return; }
     struct NvKmsKapiDynamicDisplayParams *dd = (struct NvKmsKapiDynamicDisplayParams *)IOMalloc(sizeof *dd);
     if (!dd) return;
     int added = 0;
