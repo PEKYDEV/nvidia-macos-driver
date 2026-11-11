@@ -26,12 +26,10 @@ assert '&fConnectNotify' in extract(src, 'void NVRMNVDAFramebuffer::stop(')
 assert src.index('fConnectNotify = nvrmfbCall(connectNotifyFire, this)') < src.index('super::start(provider)')
 assert 'return !fDpyLost && fEdidSize >= 128;' in src
 hotplug = extract(src, 'void NVRMNVDAFramebuffer::hotplugFire(')
-missing = hotplug[hotplug.index('for (int k = 0; k < gNDpy; k++'):]
-missing = missing[:missing.index('if (!added) return;')]
-assert 'if (!me->fKms->getDynamicDisplayInfo(me->fDev, dd) || dd->connected) continue;' in missing
-assert 'fb->fDpyLost = true;' in missing and 'fb->fEdidSize = 0;' in missing and 'fb->clearDisplayAudioProperties();' in missing
-assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
-assert hotplug.index('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')
+# Omitted handles now share the normal known-display path. Dynamic query failure,
+# successful disconnect and reconnect are exercised by test_dynamic_display_events.py.
+assert hotplug.rindex('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('notify[f]->notifyConnectionChanged(500);')
+assert hotplug.rindex('if (sl) IORecursiveLockUnlock(sl);') < hotplug.index('fb->reflip()')
 assert 'fb->fDpyLost = false;' in hotplug and 'fb->notifyConnectionChanged(500);' in hotplug
 assert 'fb->fSurf =' not in hotplug and 'fb->fSize =' not in hotplug
 fixture = r'''
